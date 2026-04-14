@@ -24,17 +24,15 @@ pub struct SshClient {
 
 impl Drop for SshClient {
     fn drop(&mut self) {
-        // Ensure the SSH process is killed if we're dropped without close()
+        // Ensure the child process is killed if we're dropped without close()
         let _ = self.child.start_kill();
     }
 }
 
 impl SshClient {
     /// Spawn `ssh <destination> atuin ssh-sync serve` and return a client connected over stdio.
-    ///
-    /// Verifies the remote is responsive by sending an initial Status request with a timeout.
     pub async fn connect(destination: &str) -> Result<Self> {
-        let mut child = tokio::process::Command::new("ssh")
+        let child = tokio::process::Command::new("ssh")
             .arg("-o")
             .arg("ConnectTimeout=10")
             .arg("--")
@@ -47,14 +45,36 @@ impl SshClient {
             .stderr(std::process::Stdio::inherit())
             .spawn()?;
 
+        Self::from_child(child).await
+    }
+
+    /// Spawn an arbitrary command that runs `atuin ssh-sync serve` on its stdio.
+    ///
+    /// The command is passed to `sh -c`, so shell syntax (pipes, env vars, etc.) works.
+    /// Examples:
+    ///   "ssh -p 2222 user@host atuin ssh-sync serve"
+    ///   "docker exec -i mycontainer atuin ssh-sync serve"
+    pub async fn connect_exec(command: &str) -> Result<Self> {
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()?;
+
+        Self::from_child(child).await
+    }
+
+    async fn from_child(mut child: Child) -> Result<Self> {
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| eyre::eyre!("failed to open stdin to ssh process"))?;
+            .ok_or_else(|| eyre::eyre!("failed to open stdin to child process"))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| eyre::eyre!("failed to open stdout from ssh process"))?;
+            .ok_or_else(|| eyre::eyre!("failed to open stdout from child process"))?;
 
         let client = Self {
             child,
@@ -95,7 +115,7 @@ impl SshClient {
         Ok(())
     }
 
-    /// Send Goodbye and wait for the SSH process to exit gracefully.
+    /// Send Goodbye and wait for the child process to exit gracefully.
     pub async fn close(mut self) -> Result<()> {
         // Send goodbye, ignoring errors (remote may have already closed)
         {

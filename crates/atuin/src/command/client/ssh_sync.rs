@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use eyre::{Context, Result};
+use eyre::{Context, Result, bail};
 
 use atuin_client::{
     database::Database,
@@ -18,10 +18,21 @@ use atuin_client::{
 #[derive(Subcommand, Debug)]
 #[command(infer_subcommands = true)]
 pub enum Cmd {
-    /// Sync with a remote machine over SSH
+    /// Sync with a remote machine over SSH (or a custom command)
     Run {
         /// SSH destination (e.g., user@hostname)
-        destination: String,
+        #[arg(required_unless_present = "exec")]
+        destination: Option<String>,
+
+        /// Custom command to start the remote sync server.
+        /// The command is passed to `sh -c` and must run `atuin ssh-sync serve`
+        /// with its stdio connected.
+        ///
+        /// Examples:
+        ///   --exec "ssh -p 2222 user@host atuin ssh-sync serve"
+        ///   --exec "docker exec -i mycontainer atuin ssh-sync serve"
+        #[arg(long, conflicts_with = "destination")]
+        exec: Option<String>,
     },
 
     /// SSH sync server (called automatically by the remote end)
@@ -37,7 +48,9 @@ impl Cmd {
         store: SqliteStore,
     ) -> Result<()> {
         match self {
-            Self::Run { destination } => run_sync(&settings, db, store, &destination).await,
+            Self::Run { destination, exec } => {
+                run_sync(&settings, db, store, destination.as_deref(), exec.as_deref()).await
+            }
             Self::Serve => run_serve(&settings, db, store).await,
         }
     }
@@ -47,13 +60,24 @@ async fn run_sync(
     settings: &Settings,
     db: &impl Database,
     store: SqliteStore,
-    destination: &str,
+    destination: Option<&str>,
+    exec: Option<&str>,
 ) -> Result<()> {
-    println!("Connecting to {destination} over SSH...");
-
-    let client = SshClient::connect(destination)
-        .await
-        .context("failed to connect over SSH")?;
+    let client = match (destination, exec) {
+        (Some(dest), None) => {
+            println!("Connecting to {dest} over SSH...");
+            SshClient::connect(dest)
+                .await
+                .context("failed to connect over SSH")?
+        }
+        (None, Some(cmd)) => {
+            println!("Running: {cmd}");
+            SshClient::connect_exec(cmd)
+                .await
+                .context("failed to start sync command")?
+        }
+        _ => bail!("provide either a destination or --exec"),
+    };
 
     let (uploaded, downloaded) = sync::sync_with_remote(&client, &store).await?;
 
@@ -93,10 +117,10 @@ async fn run_sync(
     }
 
     // Clean shutdown
-    client.close().await.context("failed to close SSH session")?;
+    client.close().await.context("failed to close session")?;
 
     println!(
-        "SSH sync complete! {} items in history database",
+        "Sync complete! {} items in history database",
         db.history_count(true).await?
     );
 
