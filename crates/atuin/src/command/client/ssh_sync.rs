@@ -108,6 +108,22 @@ async fn run_serve(
     db: &impl Database,
     store: SqliteStore,
 ) -> Result<()> {
+    // Ensure local history is materialized into the record store before serving,
+    // so the remote gets all our records (same preflight as regular sync).
+    let encryption_key: [u8; 32] = encryption::load_key(settings)
+        .context("could not load encryption key")?
+        .into();
+    let host_id = Settings::host_id().await?;
+    let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
+
+    let history_length = db.history_count(true).await?;
+    let store_history_length = store.len_tag("history").await?;
+
+    #[allow(clippy::cast_sign_loss)]
+    if history_length as u64 > store_history_length {
+        history_store.init_store(db).await?;
+    }
+
     ssh_server::serve(&store, || async {
         crate::sync::build(settings, &store, db, None).await
     })
