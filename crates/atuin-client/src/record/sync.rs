@@ -4,7 +4,7 @@ use std::{cmp::Ordering, fmt::Write};
 use eyre::Result;
 use thiserror::Error;
 
-use super::store::Store;
+use super::store::{RemoteStore, Store};
 use crate::{api_client::Client, settings::Settings};
 
 use atuin_common::record::{Diff, HostId, RecordId, RecordIdx, RecordStatus};
@@ -158,15 +158,15 @@ pub async fn operations(
 
 async fn sync_upload(
     store: &impl Store,
-    client: &Client<'_>,
+    remote: &(impl RemoteStore + ?Sized),
     host: HostId,
     tag: String,
     local: RecordIdx,
-    remote: Option<RecordIdx>,
+    remote_idx: Option<RecordIdx>,
     page_size: u64,
 ) -> Result<i64, SyncError> {
-    let remote = remote.unwrap_or(0);
-    let expected = local - remote;
+    let remote_idx = remote_idx.unwrap_or(0);
+    let expected = local - remote_idx;
     let mut progress = 0;
 
     let pb = ProgressBar::new(expected);
@@ -184,7 +184,7 @@ async fn sync_upload(
 
     loop {
         let page = store
-            .next(host, tag.as_str(), remote + progress, page_size)
+            .next(host, tag.as_str(), remote_idx + progress, page_size)
             .await
             .map_err(|e| {
                 error!("failed to read upload page: {e:?}");
@@ -196,7 +196,7 @@ async fn sync_upload(
             break;
         }
 
-        client.post_records(&page).await.map_err(|e| {
+        remote.push(&page).await.map_err(|e| {
             error!("failed to post records: {e:?}");
 
             SyncError::RemoteRequestError { msg: e.to_string() }
@@ -217,15 +217,15 @@ async fn sync_upload(
 
 async fn sync_download(
     store: &impl Store,
-    client: &Client<'_>,
+    remote: &(impl RemoteStore + ?Sized),
     host: HostId,
     tag: String,
     local: Option<RecordIdx>,
-    remote: RecordIdx,
+    remote_idx: RecordIdx,
     page_size: u64,
 ) -> Result<Vec<RecordId>, SyncError> {
     let local = local.unwrap_or(0);
-    let expected = remote - local;
+    let expected = remote_idx - local;
     let mut progress = 0;
     let mut ret = Vec::new();
 
@@ -243,8 +243,8 @@ async fn sync_download(
         .progress_chars("#>-"));
 
     loop {
-        let page = client
-            .next_records(host, tag.clone(), local + progress, page_size)
+        let page = remote
+            .fetch(host, tag.clone(), local + progress, page_size)
             .await
             .map_err(|e| SyncError::RemoteRequestError { msg: e.to_string() })?;
 
@@ -275,20 +275,9 @@ async fn sync_download(
 pub async fn sync_remote(
     operations: Vec<Operation>,
     local_store: &impl Store,
-    settings: &Settings,
+    remote: &(impl RemoteStore + ?Sized),
     page_size: u64,
 ) -> Result<(i64, Vec<RecordId>), SyncError> {
-    let client = Client::new(
-        &settings.sync_address,
-        settings
-            .sync_auth_token()
-            .await
-            .map_err(|e| SyncError::RemoteRequestError { msg: e.to_string() })?,
-        settings.network_connect_timeout,
-        settings.network_timeout,
-    )
-    .expect("failed to create client");
-
     let mut uploaded = 0;
     let mut downloaded = Vec::new();
 
@@ -299,20 +288,21 @@ pub async fn sync_remote(
                 host,
                 tag,
                 local,
-                remote,
+                remote: remote_idx,
             } => {
                 uploaded +=
-                    sync_upload(local_store, &client, host, tag, local, remote, page_size).await?
+                    sync_upload(local_store, remote, host, tag, local, remote_idx, page_size)
+                        .await?
             }
 
             Operation::Download {
                 host,
                 tag,
                 local,
-                remote,
+                remote: remote_idx,
             } => {
                 let mut d =
-                    sync_download(local_store, &client, host, tag, local, remote, page_size)
+                    sync_download(local_store, remote, host, tag, local, remote_idx, page_size)
                         .await?;
                 downloaded.append(&mut d)
             }
@@ -324,15 +314,45 @@ pub async fn sync_remote(
     Ok((uploaded, downloaded))
 }
 
+/// Sync a local store with any remote that implements RemoteStore.
+/// Returns (upload_count, downloaded_record_ids).
+pub async fn sync_with_remote(
+    remote: &(impl RemoteStore + ?Sized),
+    store: &impl Store,
+) -> Result<(i64, Vec<RecordId>), SyncError> {
+    let local_index = store
+        .status()
+        .await
+        .map_err(|e| SyncError::LocalStoreError { msg: e.to_string() })?;
+
+    let remote_index = remote
+        .status()
+        .await
+        .map_err(|e| SyncError::RemoteRequestError { msg: e.to_string() })?;
+
+    let diff = local_index.diff(&remote_index);
+    let operations = operations(diff, store).await?;
+    let (uploaded, downloaded) = sync_remote(operations, store, remote, 100).await?;
+
+    Ok((uploaded, downloaded))
+}
+
 pub async fn sync(
     settings: &Settings,
     store: &impl Store,
 ) -> Result<(i64, Vec<RecordId>), SyncError> {
-    let (diff, _) = diff(settings, store).await?;
-    let operations = operations(diff, store).await?;
-    let (uploaded, downloaded) = sync_remote(operations, store, settings, 100).await?;
+    let client = Client::new(
+        &settings.sync_address,
+        settings
+            .sync_auth_token()
+            .await
+            .map_err(|e| SyncError::RemoteRequestError { msg: e.to_string() })?,
+        settings.network_connect_timeout,
+        settings.network_timeout,
+    )
+    .map_err(|e| SyncError::OperationalError { msg: e.to_string() })?;
 
-    Ok((uploaded, downloaded))
+    sync_with_remote(&client, store).await
 }
 
 #[cfg(test)]

@@ -44,6 +44,9 @@ fn cleanup_old_logs(log_dir: &Path, prefix: &str, retention_days: u64) {
 mod sync;
 
 #[cfg(feature = "sync")]
+mod ssh_sync;
+
+#[cfg(feature = "sync")]
 mod account;
 
 #[cfg(feature = "daemon")]
@@ -93,6 +96,11 @@ pub enum Cmd {
     #[cfg(feature = "sync")]
     #[command(flatten)]
     Sync(sync::Cmd),
+
+    /// Sync with a remote machine over SSH
+    #[cfg(feature = "sync")]
+    #[command(subcommand)]
+    SshSync(ssh_sync::Cmd),
 
     /// Manage your sync account
     #[cfg(feature = "sync")]
@@ -365,6 +373,9 @@ impl Cmd {
 
             #[cfg(feature = "sync")]
             Self::Sync(sync) => sync.run(settings, &db, sqlite_store).await,
+
+            #[cfg(feature = "sync")]
+            Self::SshSync(cmd) => cmd.run(settings, &db, sqlite_store).await,
 
             #[cfg(feature = "sync")]
             Self::Account(account) => account.run(settings, sqlite_store).await,

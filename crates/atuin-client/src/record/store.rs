@@ -3,6 +3,21 @@ use eyre::Result;
 
 use atuin_common::record::{EncryptedData, HostId, Record, RecordId, RecordIdx, RecordStatus};
 
+/// The minimal interface the sync algorithm needs from a remote.
+/// Implemented by the HTTP Client, SshClient, or anything else that can store records.
+#[async_trait]
+pub trait RemoteStore: Send + Sync {
+    async fn status(&self) -> Result<RecordStatus>;
+    async fn push(&self, records: &[Record<EncryptedData>]) -> Result<()>;
+    async fn fetch(
+        &self,
+        host: HostId,
+        tag: String,
+        start: RecordIdx,
+        count: u64,
+    ) -> Result<Vec<Record<EncryptedData>>>;
+}
+
 /// A record store stores records
 /// In more detail - we tend to need to process this into _another_ format to actually query it.
 /// As is, the record store is intended as the source of truth for arbitrary data, which could

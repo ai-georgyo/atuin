@@ -22,6 +22,8 @@ use atuin_common::{
     record::RecordStatus,
 };
 
+use crate::record::store::RemoteStore;
+
 use semver::Version;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -457,5 +459,26 @@ impl<'a> Client<'a> {
         } else {
             bail!("Unknown error");
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl RemoteStore for Client<'_> {
+    async fn status(&self) -> Result<RecordStatus> {
+        self.record_status().await
+    }
+
+    async fn push(&self, records: &[Record<EncryptedData>]) -> Result<()> {
+        self.post_records(records).await
+    }
+
+    async fn fetch(
+        &self,
+        host: HostId,
+        tag: String,
+        start: RecordIdx,
+        count: u64,
+    ) -> Result<Vec<Record<EncryptedData>>> {
+        self.next_records(host, tag, start, count).await
     }
 }

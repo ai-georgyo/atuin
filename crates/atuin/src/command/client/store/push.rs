@@ -92,7 +92,14 @@ impl Push {
             })
             .collect();
 
-        let (uploaded, _) = sync::sync_remote(operations, &store, settings, self.page).await?;
+        let client = Client::new(
+            &settings.sync_address,
+            settings.sync_auth_token().await?,
+            settings.network_connect_timeout,
+            settings.network_timeout,
+        )?;
+
+        let (uploaded, _) = sync::sync_remote(operations, &store, &client, self.page).await?;
 
         println!("Uploaded {uploaded} records");
 

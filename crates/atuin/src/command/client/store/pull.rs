@@ -2,6 +2,7 @@ use clap::Args;
 use eyre::Result;
 
 use atuin_client::{
+    api_client::Client,
     database::Database,
     record::store::Store,
     record::sync::Operation,
@@ -72,7 +73,14 @@ impl Pull {
             })
             .collect();
 
-        let (_, downloaded) = sync::sync_remote(operations, &store, settings, self.page).await?;
+        let client = Client::new(
+            &settings.sync_address,
+            settings.sync_auth_token().await?,
+            settings.network_connect_timeout,
+            settings.network_timeout,
+        )?;
+
+        let (_, downloaded) = sync::sync_remote(operations, &store, &client, self.page).await?;
 
         println!("Downloaded {} records", downloaded.len());
 
