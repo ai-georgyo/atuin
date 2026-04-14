@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use eyre::{Result, bail};
 use tokio::io::{BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -8,20 +10,33 @@ use atuin_common::record::{EncryptedData, HostId, Record, RecordIdx, RecordStatu
 use super::ssh_protocol::{Request, Response, read_message, write_message};
 use super::store::RemoteStore;
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct SshIo {
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
 }
 
 pub struct SshClient {
-    child: Mutex<Child>,
+    child: Child,
     io: Mutex<SshIo>,
+}
+
+impl Drop for SshClient {
+    fn drop(&mut self) {
+        // Ensure the SSH process is killed if we're dropped without close()
+        let _ = self.child.start_kill();
+    }
 }
 
 impl SshClient {
     /// Spawn `ssh <destination> atuin ssh-sync serve` and return a client connected over stdio.
+    ///
+    /// Verifies the remote is responsive by sending an initial Status request with a timeout.
     pub async fn connect(destination: &str) -> Result<Self> {
         let mut child = tokio::process::Command::new("ssh")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
             .arg(destination)
             .arg("--")
             .arg("atuin")
@@ -41,13 +56,25 @@ impl SshClient {
             .take()
             .ok_or_else(|| eyre::eyre!("failed to open stdout from ssh process"))?;
 
-        Ok(Self {
-            child: Mutex::new(child),
+        let client = Self {
+            child,
             io: Mutex::new(SshIo {
                 stdin: BufWriter::new(stdin),
                 stdout: BufReader::new(stdout),
             }),
-        })
+        };
+
+        // Verify the remote is responsive with a timeout
+        match tokio::time::timeout(CONNECT_TIMEOUT, client.request(&Request::Status)).await {
+            Ok(Ok(Response::Status { .. })) => {}
+            Ok(Ok(other)) => bail!("unexpected response during handshake: {other:?}"),
+            Ok(Err(e)) => {
+                return Err(e.wrap_err("remote atuin failed to respond — is atuin installed on the remote?"))
+            }
+            Err(_) => bail!("timed out waiting for remote atuin to respond ({}s)", CONNECT_TIMEOUT.as_secs()),
+        }
+
+        Ok(client)
     }
 
     async fn request(&self, req: &Request) -> Result<Response> {
@@ -68,15 +95,14 @@ impl SshClient {
         Ok(())
     }
 
-    /// Send Goodbye and wait for the SSH process to exit.
-    pub async fn close(self) -> Result<()> {
+    /// Send Goodbye and wait for the SSH process to exit gracefully.
+    pub async fn close(mut self) -> Result<()> {
         // Send goodbye, ignoring errors (remote may have already closed)
         {
             let mut io = self.io.lock().await;
             let _ = write_message(&mut io.stdin, &Request::Goodbye).await;
         }
-        let mut child = self.child.into_inner();
-        child.wait().await?;
+        self.child.wait().await?;
         Ok(())
     }
 }
