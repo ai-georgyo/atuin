@@ -3,14 +3,22 @@ use std::future::Future;
 use eyre::Result;
 use tokio::io::{BufReader, BufWriter};
 
+use super::encryption::PASETO_V4;
 use super::ssh_protocol::{Request, Response, read_message, write_message};
 use super::store::Store;
 
 /// Run the SSH sync server loop, reading requests from stdin and writing responses to stdout.
 ///
+/// The `encryption_key` is used to filter incoming records — only records encrypted with
+/// a matching key are accepted. This prevents foreign-key records from poisoning the store.
+///
 /// The `on_build` callback is invoked when the client requests BuildRemote. This allows the
 /// caller (in the CLI crate) to run the full build() that spans multiple crates.
-pub async fn serve<F>(store: &impl Store, on_build: impl FnOnce() -> F) -> Result<()>
+pub async fn serve<F>(
+    store: &impl Store,
+    encryption_key: &[u8; 32],
+    on_build: impl FnOnce() -> F,
+) -> Result<()>
 where
     F: Future<Output = Result<()>>,
 {
@@ -37,12 +45,26 @@ where
                 },
             },
 
-            Request::Push { records } => match store.push_batch(records.iter()).await {
-                Ok(()) => Response::PushOk,
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
-            },
+            Request::Push { records } => {
+                // Filter out records encrypted with a different key
+                let (ours, foreign): (Vec<_>, Vec<_>) = records
+                    .iter()
+                    .partition(|r| PASETO_V4::key_matches(&r.data, encryption_key));
+
+                if !foreign.is_empty() {
+                    debug!(
+                        "ssh-sync serve: rejected {} records with non-matching key",
+                        foreign.len()
+                    );
+                }
+
+                match store.push_batch(ours.into_iter()).await {
+                    Ok(()) => Response::PushOk,
+                    Err(e) => Response::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
 
             Request::Fetch {
                 host,

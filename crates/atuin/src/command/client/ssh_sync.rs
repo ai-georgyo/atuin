@@ -6,6 +6,7 @@ use atuin_client::{
     encryption,
     history::store::HistoryStore,
     record::{
+        encryption::PASETO_V4,
         sqlite_store::SqliteStore,
         ssh_client::SshClient,
         ssh_server,
@@ -63,6 +64,10 @@ async fn run_sync(
     destination: Option<&str>,
     exec: Option<&str>,
 ) -> Result<()> {
+    let encryption_key: [u8; 32] = encryption::load_key(settings)
+        .context("could not load encryption key")?
+        .into();
+
     let client = match (destination, exec) {
         (Some(dest), None) => {
             println!("Connecting to {dest} over SSH...");
@@ -81,6 +86,39 @@ async fn run_sync(
 
     let (uploaded, downloaded) = sync::sync_with_remote(&client, &store).await?;
 
+    // Filter out any downloaded records that don't match our encryption key.
+    // This prevents foreign-key records from poisoning the store if the remote
+    // has a different key.
+    let mut foreign_count = 0usize;
+    let downloaded: Vec<_> = {
+        let mut kept = Vec::with_capacity(downloaded.len());
+        for id in &downloaded {
+            match store.get(*id).await {
+                Ok(record) => {
+                    if PASETO_V4::key_matches(&record.data, &encryption_key) {
+                        kept.push(*id);
+                    } else {
+                        foreign_count += 1;
+                        // Remove the foreign record from our store
+                        let _ = store.delete(*id).await;
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        kept
+    };
+
+    if foreign_count > 0 {
+        println!(
+            "Warning: skipped {foreign_count} records from remote encrypted with a different key."
+        );
+        println!(
+            "Both machines must share the same encryption key to sync. \
+             Run `atuin key` on one machine, then `atuin store rekey '<key>'` on the other."
+        );
+    }
+
     println!("{uploaded}/{} up/down to record store", downloaded.len());
 
     // Tell the remote to materialize its records
@@ -93,9 +131,6 @@ async fn run_sync(
     crate::sync::build(settings, &store, db, Some(&downloaded)).await?;
 
     // Check if local history needs re-init (same logic as regular sync)
-    let encryption_key: [u8; 32] = encryption::load_key(settings)
-        .context("could not load encryption key")?
-        .into();
     let host_id = Settings::host_id().await?;
     let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
@@ -132,14 +167,13 @@ async fn run_serve(
     db: &impl Database,
     store: SqliteStore,
 ) -> Result<()> {
-    // Ensure local history is materialized into the record store before serving,
-    // so the remote gets all our records (same preflight as regular sync).
     let encryption_key: [u8; 32] = encryption::load_key(settings)
         .context("could not load encryption key")?
         .into();
     let host_id = Settings::host_id().await?;
     let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
+    // Ensure local history is materialized into the record store before serving
     let history_length = db.history_count(true).await?;
     let store_history_length = store.len_tag("history").await?;
 
@@ -148,7 +182,7 @@ async fn run_serve(
         history_store.init_store(db).await?;
     }
 
-    ssh_server::serve(&store, || async {
+    ssh_server::serve(&store, &encryption_key, || async {
         crate::sync::build(settings, &store, db, None).await
     })
     .await

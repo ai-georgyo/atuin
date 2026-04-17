@@ -114,6 +114,20 @@ impl Encryption for PASETO_V4 {
 }
 
 impl PASETO_V4 {
+    /// Check whether a record's content encryption key was wrapped with the given key.
+    /// Returns true if the key IDs match, false otherwise.
+    /// This does NOT attempt decryption — it only compares the key ID in the footer.
+    pub fn key_matches(data: &EncryptedData, key: &[u8; 32]) -> bool {
+        let wrapping_key = Key::<V4, Local>::from_bytes(*key);
+        let current_kid = wrapping_key.to_id();
+
+        let Ok(footer) = serde_json::from_str::<AtuinFooter>(&data.content_encryption_key) else {
+            return false;
+        };
+
+        footer.kid == current_kid
+    }
+
     fn decrypt_cek(wrapped_cek: String, key: &[u8; 32]) -> Result<Key<V4, Local>> {
         let wrapping_key = Key::<V4, Local>::from_bytes(*key);
 
